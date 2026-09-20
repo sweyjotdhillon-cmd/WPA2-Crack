@@ -10,8 +10,9 @@ import os
 from wpa2crack.system import print_doctor_report
 from wpa2crack.benchmark import print_benchmark_report
 from wpa2crack.pcap import extract_handshake, PCAPError
-from wpa2crack.cracker import crack
+from wpa2crack.cracker import crack, CrackerError
 from wpa2crack.radio import get_radio_backend, RadioBackendError
+from wpa2crack.password_strength import evaluate_password_strength
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -33,6 +34,10 @@ def main() -> None:
     crack_parser.add_argument("-p", "--pcap", required=True, help="Path to PCAP file containing EAPOL 4-way handshake")
     crack_parser.add_argument("-w", "--wordlist", required=True, help="Path to wordlist file")
     crack_parser.add_argument("-c", "--workers", type=int, default=None, help="Number of CPU worker processes")
+
+    # password-strength
+    strength_parser = subparsers.add_parser("password-strength", help="Defensively evaluate candidate passphrase strength")
+    strength_parser.add_argument("passphrase", help="Passphrase string to evaluate")
 
     # scan (privileged radio)
     scan_parser = subparsers.add_parser("scan", help="Scan for nearby Wi-Fi networks (live radio - unsupported on non-root Android)")
@@ -63,6 +68,20 @@ def main() -> None:
     elif args.command == "benchmark":
         print_benchmark_report(workers=args.workers)
 
+    elif args.command == "password-strength":
+        res = evaluate_password_strength(args.passphrase)
+        print("=== Defensive Password Strength Report ===")
+        print(f"Passphrase    : {res['passphrase']}")
+        print(f"Length        : {res['length']} chars (Valid WPA2: {res['valid_wpa2_length']})")
+        print(f"Entropy       : {res['entropy_bits']} bits")
+        print(f"Charset Size  : {res['charset_size']}")
+        print(f"Rating        : {res['rating']} (Score: {res['score']}/10)")
+        if res['warnings']:
+            print("Warnings / Recommendations:")
+            for warn in res['warnings']:
+                print(f" - {warn}")
+        print("==========================================")
+
     elif args.command == "crack":
         if not os.path.exists(args.pcap):
             sys.exit(f"[!] Error: PCAP file not found: {args.pcap}")
@@ -76,7 +95,10 @@ def main() -> None:
         except Exception as e:
             sys.exit(f"[!] Unexpected error loading PCAP: {e}")
 
-        found_pwd, total_tried, elapsed = crack(handshake, args.wordlist, workers=args.workers)
+        try:
+            found_pwd, total_tried, elapsed = crack(handshake, args.wordlist, workers=args.workers)
+        except CrackerError as e:
+            sys.exit(f"[!] Cracker Error: {e}")
 
         if found_pwd:
             print(f"\n[+] Password found: {found_pwd} (took {elapsed:.2f} seconds, tried {total_tried} passwords)")

@@ -1,129 +1,125 @@
-# WPA2-Crack (Android Termux / Python 3.13 Port)
+# WPA2-Crack (Android Termux / ARM64 Production Port)
 
-A clean, reliable, non-root Android (Termux / ARM64) port of **WPA2-Crack** for offline 4-way handshake analysis, PCAP packet processing, cryptographic key derivation, and CPU benchmarking.
-
----
-
-## Target Environment & Architecture
-
-- **OS / Platform**: Android (ARM64 / aarch64) in Termux
-- **Privilege Level**: NON-ROOT userspace
-- **Python Version**: Python 3.13.x (compatible with Python >= 3.10)
-- **Execution Mode**: CPU-only execution (multi-core streaming)
-- **Dependencies**: Minimal standard-library reliance (`hashlib`, `hmac`, `struct`, `concurrent.futures`, `dataclasses`, `pathlib`). Optional dependency on `scapy>=2.5.0` for 802.11 frame extraction.
+A production-quality Python 3.13 userspace application for offline WPA2 4-way handshake analysis, PCAP parsing, cryptographic key derivation, password strength evaluation, and CPU benchmarking in standard non-root **Android / Termux**.
 
 ---
 
-## Feature Matrix & Capability Separation
+## Primary Workflow: Non-Root Android Userspace
 
-The application explicitly separates offline userspace processing from privileged live-radio operations.
+This application is built and optimized specifically for standard non-root Android running in **Termux** on ARM64 (`aarch64`) mobile platforms (such as MediaTek MT6835T with integrated Wi-Fi).
 
-| Feature Category | Capability Status | Description |
+All core operations operate strictly in **userspace** using pure Python standard library routines and do not require root privileges, custom kernels, or modified Wi-Fi drivers.
+
+---
+
+## Feature Separation Matrix
+
+### SUPPORTED ON NON-ROOT ANDROID USERSPACE
+
+| Feature | Description | Primary Engine |
 | :--- | :--- | :--- |
-| **Offline PCAP Reading** | **SUPPORTED** | Parses 802.11 PCAP captures and extracts EAPOL 4-way handshakes |
-| **PCAP Validation** | **SUPPORTED** | Verifies PCAP headers, magic bytes, snaplen, and frame integrity |
-| **Cryptographic Engine** | **SUPPORTED** | PBKDF2 HMAC-SHA1 (4096 iterations), PTK derivation (PRF-512), WPA2 MIC verification |
-| **CPU Benchmarking** | **SUPPORTED** | Measures local PBKDF2/PTK/MIC key derivation throughput across CPU cores |
-| **Environment Diagnostics** | **SUPPORTED** | `python main.py doctor` reports Android/Termux, CPU count, RAM, and capabilities |
-| **Wordlist Cracking** | **SUPPORTED** | Low-memory line-by-line wordlist streaming across configurable worker processes |
-| **Live Wi-Fi Scanning** | *UNSUPPORTED* | Requires root & monitor mode (Not available on stock non-root Android) |
-| **Handshake Capture** | *UNSUPPORTED* | Requires raw 802.11 packet sniffing in monitor mode |
-| **Deauthentication** | *UNSUPPORTED* | Requires raw 802.11 packet injection |
-
-When live radio commands (`scan`, `capture`, `deauth`) are executed on non-root Android, the system cleanly reports:
-```
-Live Wi-Fi capture: NOT AVAILABLE
-Reason: non-root Android does not expose the required privileged monitor/raw 802.11 interface to this application.
-Use an externally supplied PCAP/test fixture for offline analysis.
-```
+| **System Diagnostics** | Environment, RAM, CPU core count, and capability detection | `python main.py doctor` |
+| **PCAP Validation** | Magic, endianness, version, snaplen, and linktype validation | `wpa2crack.pcap` (Native stdlib) |
+| **802.11 / EAPOL Parsing** | Safe extraction of SSID, MACs, nonces, and MIC from PCAPs | Standard library `struct` |
+| **Crypto Derivation** | PBKDF2 HMAC-SHA1 (4096 iter), PTK (PRF-512), MIC verification | Standard library `hashlib`/`hmac` |
+| **Passphrase Evaluation** | Defensive security strength, entropy, and pattern analysis | `python main.py password-strength` |
+| **CPU Benchmarking** | Warm-up phase, multi-trial, median throughput calculation | `python main.py benchmark` |
+| **Wordlist Cracking** | Memory-safe line-by-line streaming across CPU processes | `python main.py crack` |
+| **Automated Tests** | Full 20-point test suite with binary parser fixtures | `python -m unittest discover` |
 
 ---
 
-## Termux Installation Commands
+### NOT AVAILABLE ON STOCK NON-ROOT ANDROID
 
-Run the following commands inside Termux on your Android device:
+The following privileged radio operations are **isolated behind a radio abstraction layer** (`UnsupportedAndroidBackend`) and are **NOT supported on stock non-root Android**:
+
+- Monitor mode
+- Raw 802.11 packet capture
+- Packet injection
+- Deauthentication packets
+- Privileged channel switching / radio control
+
+When executed in non-root Android/Termux, commands requesting live radio operations (`scan`, `capture`, `deauth`) cleanly return an explicit unsupported capability message rather than attempting illegal kernel calls or bypassing permissions.
+
+---
+
+## Termux Installation & Quick Start
+
+### 1. Installation in Termux
+
+Execute the following commands in standard Termux (no root or proot needed):
 
 ```bash
 pkg update && pkg upgrade -y
-pkg install python libffi clang -y
+pkg install python -y
 git clone https://github.com/Njord0/WPA2-Crack.git
 cd WPA2-Crack
-pip install -r requirements.txt
 ```
 
----
+### 2. Run System Diagnostics (`doctor`)
 
-## Usage & Commands
+Check Android environment, Termux status, CPU count, physical vs process available RAM, and parser status:
 
-### 1. System Diagnostics (`doctor`)
-Inspect system environment, Android/Termux detection, CPU count, RAM, and capability status:
 ```bash
 python main.py doctor
 ```
 
-### 2. Cryptographic CPU Benchmark (`benchmark`)
-Measure local WPA2 PBKDF2 HMAC-SHA1 calculation speed:
+### 3. Run CPU Benchmark (`benchmark`)
+
+Measure local PBKDF2 HMAC-SHA1 key derivation throughput across CPU worker processes:
+
 ```bash
 python main.py benchmark
 ```
-Optionally specify worker thread/process count:
+
+Optionally specify worker count:
+
 ```bash
 python main.py benchmark -w 4
 ```
 
-### 3. Passphrase Cracking (`crack`)
-Perform offline cracking using a local PCAP file containing an EAPOL 4-way handshake and a wordlist:
+### 4. Evaluate Passphrase Strength (`password-strength`)
+
+Analyze a candidate passphrase against WPA2 standards, entropy, character sets, and common weak patterns:
+
 ```bash
-python main.py crack -p handshake.pcap -w wordlist.txt -c 4
+python main.py password-strength "MyStrongPassphrase123!"
 ```
 
-### 4. Legacy Script Wrappers
-The original entry-point scripts are preserved for backwards compatibility and routed through the new architecture:
+### 5. Offline Passphrase Cracking (`crack`)
+
+Crack a WPA2 passphrase using an externally captured PCAP file and a wordlist:
+
 ```bash
-python crack_password.py -p handshake.pcap -w wordlist.txt
-python capture_handshake.py -i wlan0 -b 00:11:22:33:44:55 -c 1
-python scan_wifi.py -i wlan0
-python deauth.py -i wlan0 -b 00:11:22:33:44:55
+python main.py crack -p capture.pcap -w wordlist.txt -c 2
 ```
 
 ---
 
 ## Running Automated Tests
 
-Run the complete test suite with `unittest`:
+Run the complete 20-point unit test suite:
+
 ```bash
 python -m unittest discover -s tests -p "test_*.py"
 ```
 
 ---
 
-## Project Architecture
+## Architecture Overview
 
 ```
 WPA2-Crack/
-├── main.py                  # Main CLI entry point
-├── crack_password.py        # Legacy wrapper script
-├── capture_handshake.py     # Legacy wrapper script
-├── deauth.py                # Legacy wrapper script
-├── scan_wifi.py             # Legacy wrapper script
-├── requirements.txt         # Dependency specification
-├── README.md                # Documentation
-├── wpa2crack/               # Core Python package
+├── main.py                     # Unified CLI entry point
+├── wpa2crack/                  # Core Python package
 │   ├── __init__.py
-│   ├── system.py            # Android/Termux & hardware diagnostics
-│   ├── radio.py             # RadioBackend abstraction layer
-│   ├── crypto.py            # PBKDF2, PTK, and MIC verification
-│   ├── pcap.py              # PCAP header and 802.11 / EAPOL parser
-│   ├── cracker.py           # Multi-process wordlist streaming cracker
-│   └── benchmark.py         # CPU crypto benchmark engine
-└── tests/                   # Automated unit tests
-    └── test_all.py
+│   ├── system.py               # Android/Termux & hardware diagnostics
+│   ├── pcap.py                 # Pure-Python stdlib PCAP/802.11/EAPOL parser
+│   ├── crypto.py               # PBKDF2, PTK, and MIC calculation engine
+│   ├── password_strength.py    # Defensive passphrase evaluation engine
+│   ├── cracker.py              # Low-memory streaming multi-core cracker
+│   ├── benchmark.py            # Warm-up & median CPU benchmark engine
+│   └── radio.py                # RadioBackend abstraction (UnsupportedAndroidBackend)
+└── tests/
+    └── test_all.py             # 20-point comprehensive test suite
 ```
-
----
-
-## Known Android / Termux Limitations
-
-1. **No Monitor Mode / Raw 802.11 Injection**: Stock Android Wi-Fi drivers and Android userspace permissions block monitor mode and raw socket packet injection without root and kernel patches.
-2. **Offline-Only Focus**: Handshake PCAPs must be acquired on external hardware or supported devices and transferred to Termux for local offline analysis.
-3. **RAM & Thermal Management**: The cracker uses line-by-line wordlist streaming to prevent out-of-memory errors on mobile devices.

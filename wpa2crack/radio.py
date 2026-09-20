@@ -1,6 +1,6 @@
 """
 Radio backend abstraction layer for WPA2-Crack.
-Isolates privileged radio operations (monitor mode, packet capture, deauth, scanning).
+Isolates privileged radio operations (monitor mode, raw capture, packet injection, deauth).
 """
 
 from abc import ABC, abstractmethod
@@ -42,13 +42,17 @@ class RadioBackend(ABC):
 
 
 class UnsupportedAndroidBackend(RadioBackend):
-    """Backend representing unsupported live radio on non-root Android/Termux or unprivileged environments."""
+    """
+    Backend representing unsupported live radio on non-root Android/Termux or unprivileged environments.
+    Guarantees non-root Android never attempts privileged radio operations.
+    """
 
     def __init__(self, reason: str | None = None):
         self.reason = reason or (
-            "Live Wi-Fi capture: NOT AVAILABLE\n"
-            "Reason: non-root Android does not expose the required privileged monitor/raw 802.11 interface to this application.\n"
-            "Use an externally supplied PCAP/test fixture for offline analysis."
+            "UNSUPPORTED PRIVILEGED RADIO CAPABILITY:\n"
+            "Non-root Android userspace cannot access raw Wi-Fi radio interfaces, "
+            "monitor mode, packet capture, packet injection, or deauthentication.\n"
+            "This application operates strictly in userspace offline analysis mode on Android."
         )
 
     def is_available(self) -> bool:
@@ -58,7 +62,7 @@ class UnsupportedAndroidBackend(RadioBackend):
         return self.reason
 
     def _raise_error(self, operation_name: str) -> NoReturn:
-        raise RadioBackendError(f"Cannot perform '{operation_name}': {self.reason}")
+        raise RadioBackendError(f"Cannot perform '{operation_name}':\n{self.reason}")
 
     def start_scan(self, interface: str) -> NoReturn:
         self._raise_error("wifi scan")
@@ -70,7 +74,7 @@ class UnsupportedAndroidBackend(RadioBackend):
         self._raise_error("deauth packet injection")
 
 
-class LinuxMonitorBackend(RadioBackend):
+class LinuxReferenceBackend(RadioBackend):
     """Reference backend for desktop Linux environments with root/monitor mode."""
 
     def is_available(self) -> bool:
@@ -78,30 +82,32 @@ class LinuxMonitorBackend(RadioBackend):
 
     def get_unsupported_reason(self) -> str:
         if is_android():
-            return "Android userspace environment is not supported for live radio ops."
+            return "Android userspace environment is strictly non-root/offline."
         if not is_root():
-            return "Root privileges (sudo) required for monitor mode and packet injection."
+            return "Root privileges required for monitor mode and packet injection on desktop Linux."
         return ""
 
     def start_scan(self, interface: str) -> NoReturn:
         if not self.is_available():
             raise RadioBackendError(self.get_unsupported_reason())
-        # Reference implementation stub for desktop linux
-        raise NotImplementedError("LinuxMonitorBackend requires scapy and root monitor interface on desktop Linux.")
+        raise NotImplementedError("LinuxReferenceBackend requires scapy and root monitor interface on desktop Linux.")
 
     def start_capture(self, interface: str, bssid: str, channel: int, output: str | None = None) -> NoReturn:
         if not self.is_available():
             raise RadioBackendError(self.get_unsupported_reason())
-        raise NotImplementedError("LinuxMonitorBackend requires scapy and root monitor interface on desktop Linux.")
+        raise NotImplementedError("LinuxReferenceBackend requires scapy and root monitor interface on desktop Linux.")
 
     def send_deauth(self, interface: str, bssid: str, client: str = "ff:ff:ff:ff:ff:ff") -> NoReturn:
         if not self.is_available():
             raise RadioBackendError(self.get_unsupported_reason())
-        raise NotImplementedError("LinuxMonitorBackend requires scapy and root monitor interface on desktop Linux.")
+        raise NotImplementedError("LinuxReferenceBackend requires scapy and root monitor interface on desktop Linux.")
+
+# Alias for backward compatibility
+LinuxMonitorBackend = LinuxReferenceBackend
 
 
 def get_radio_backend() -> RadioBackend:
     """Factory function to get appropriate radio backend for current system."""
     if is_android() or not is_root():
         return UnsupportedAndroidBackend()
-    return LinuxMonitorBackend()
+    return LinuxReferenceBackend()
