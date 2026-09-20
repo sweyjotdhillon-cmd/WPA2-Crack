@@ -227,14 +227,37 @@ class TestPCAPEndianAndMalformed(unittest.TestCase):
     def test_8_truncated_pcap_record(self):
         pcap_path = os.path.join(self.temp_dir.name, "truncated.pcap")
         header = make_pcap_header(endian="<")
-        # Record says payload length is 100 bytes, but we only supply 10 bytes
-        bad_rec = make_pcap_record(b"X" * 10, endian="<", incl_len=100)
+        # Record says payload length is 100 bytes, orig_len=100, but we only supply 10 bytes of payload
+        bad_rec = make_pcap_record(b"X" * 10, endian="<", incl_len=100, orig_len=100)
         with open(pcap_path, "wb") as f:
             f.write(header + bad_rec)
 
         with self.assertRaises(PCAPError) as ctx:
             parse_handshake_native(pcap_path)
         self.assertIn("Truncated PCAP packet record", str(ctx.exception))
+
+    def test_8b_pcap_incl_len_exceeds_orig_len(self):
+        pcap_path = os.path.join(self.temp_dir.name, "invalid_incl_len.pcap")
+        header = make_pcap_header(endian="<")
+        # incl_len (100) > orig_len (10)
+        bad_rec = make_pcap_record(b"X" * 10, endian="<", incl_len=100, orig_len=10)
+        with open(pcap_path, "wb") as f:
+            f.write(header + bad_rec)
+
+        with self.assertRaises(PCAPError) as ctx:
+            parse_handshake_native(pcap_path)
+        self.assertIn("captured length (100) exceeds original length (10)", str(ctx.exception))
+
+    def test_8c_pcap_version_validation(self):
+        pcap_path = os.path.join(self.temp_dir.name, "bad_ver.pcap")
+        # Version 1.4
+        pcap_hdr = b"\xd4\xc3\xb2\xa1" + struct.pack("<HHIIII", 1, 4, 0, 0, 65535, 105)
+        with open(pcap_path, "wb") as f:
+            f.write(pcap_hdr)
+
+        with self.assertRaises(PCAPError) as ctx:
+            validate_pcap_header(pcap_path)
+        self.assertIn("Unsupported PCAP version: 1.4", str(ctx.exception))
 
     def test_9_malformed_packet_lengths(self):
         pcap_path = os.path.join(self.temp_dir.name, "overlong.pcap")
@@ -312,6 +335,43 @@ class TestEAPOLAndMissingFrames(unittest.TestCase):
         with self.assertRaises(PCAPError) as ctx:
             parse_handshake_native(pcap_path)
         self.assertIn("does not contain complete EAPOL 4-way handshake", str(ctx.exception))
+
+    def test_12b_malformed_eapol_frames(self):
+        from wpa2crack.pcap import _parse_eapol_frame
+        ap_mac = b"\x00\x11\x22\x33\x44\x55"
+        client_mac = b"\xaa\xbb\xcc\xdd\xee\xff"
+
+        # Truncated EAPOL payload (< 99 bytes)
+        self.assertIsNone(_parse_eapol_frame(b"\x01\x03\x00\x1012345", ap_mac, client_mac))
+
+        # Invalid EAPOL type (not 3)
+        bad_type_eapol = b"\x01\x01\x00\x5f" + b"\x00" * 95
+        self.assertIsNone(_parse_eapol_frame(bad_type_eapol, ap_mac, client_mac))
+
+        # Zero nonce/mic in Msg1/Msg2
+        zero_nonce_eapol = make_eapol_frame(1, ap_mac, client_mac, b"\x00" * 32)[32:] # strip MAC/LLC
+        self.assertIsNone(_parse_eapol_frame(zero_nonce_eapol, ap_mac, client_mac))
+
+    def test_12c_large_pcap_streaming_performance(self):
+        pcap_path = os.path.join(self.temp_dir.name, "large_stream.pcap")
+        ap_mac = b"\x00\x11\x22\x33\x44\x55"
+        client_mac = b"\xaa\xbb\xcc\xdd\xee\xff"
+
+        pcap_hdr = make_pcap_header(endian="<")
+        dummy_packet = make_pcap_record(b"\x00" * 100, endian="<")
+
+        with open(pcap_path, "wb") as f:
+            f.write(pcap_hdr)
+            f.write(make_pcap_record(make_beacon_frame(ssid="StreamNet"), endian="<"))
+            # Write 5,000 dummy non-EAPOL packet records
+            f.write(dummy_packet * 5000)
+            f.write(make_pcap_record(make_eapol_frame(1, ap_mac, client_mac, b"\x11" * 32), endian="<"))
+            f.write(make_pcap_record(make_eapol_frame(2, ap_mac, client_mac, b"\x22" * 32, mic=b"\x33" * 16), endian="<"))
+
+        hs = parse_handshake_native(pcap_path)
+        self.assertEqual(hs.ssid, "StreamNet")
+        self.assertEqual(hs.anonce, b"\x11" * 32)
+        self.assertEqual(hs.snonce, b"\x22" * 32)
 
 
 class TestCryptoAndStreaming(unittest.TestCase):

@@ -73,6 +73,9 @@ def validate_pcap_header(filepath: str) -> dict:
     except struct.error as e:
         raise PCAPError(f"Malformed PCAP global header: {e}")
 
+    if ver_major != 2:
+        raise PCAPError(f"Unsupported PCAP version: {ver_major}.{ver_minor} (only version 2.x is supported)")
+
     return {
         "magic": magic.hex(),
         "version": f"{ver_major}.{ver_minor}",
@@ -98,140 +101,150 @@ def parse_handshake_native(filepath: str) -> HandshakeData:
     if linktype not in (105, 127, 1):
         raise PCAPError(f"Unsupported PCAP link type: {linktype} (supported: 105=802.11, 127=Radiotap, 1=Ethernet)")
 
-    try:
-        with open(filepath, "rb") as f:
-            f.seek(24) # Skip 24-byte PCAP header
-            pcap_payload = f.read()
-    except Exception as e:
-        raise PCAPError(f"Failed reading PCAP body: {e}")
-
-    offset = 0
-    payload_len = len(pcap_payload)
-
     ssid: Optional[str] = None
     msg1_data: Optional[dict] = None
     msg2_data: Optional[dict] = None
 
-    while offset + 16 <= payload_len:
-        rec_header = pcap_payload[offset:offset + 16]
-        offset += 16
+    try:
+        f = open(filepath, "rb")
+    except Exception as e:
+        raise PCAPError(f"Failed opening PCAP file: {e}")
 
-        try:
-            ts_sec, ts_usec, incl_len, orig_len = struct.unpack(f"{endian}IIII", rec_header)
-        except struct.error as e:
-            raise PCAPError(f"Malformed PCAP packet record header at offset {offset-16}: {e}")
+    try:
+        f.seek(24) # Skip 24-byte PCAP header
+        record_idx = 0
+        while True:
+            if ssid and msg1_data and msg2_data:
+                break
 
-        if incl_len > snaplen or incl_len > 65535:
-            raise PCAPError(f"Malformed packet length {incl_len} exceeds snaplen {snaplen}")
+            offset = f.tell()
+            rec_header = f.read(16)
+            if not rec_header:
+                break # EOF reached cleanly
+            if len(rec_header) < 16:
+                raise PCAPError(f"Truncated PCAP packet record header at offset {offset}: read {len(rec_header)}/16 bytes")
 
-        if offset + incl_len > payload_len:
-            raise PCAPError(f"Truncated PCAP packet record: expected {incl_len} bytes, available {payload_len - offset} bytes")
-
-        pkt = pcap_payload[offset:offset + incl_len]
-        offset += incl_len
-
-        # Process frame based on linktype
-        pkt_offset = 0
-        if linktype == 127: # Radiotap header
-            if len(pkt) < 4:
-                continue
             try:
-                rt_hdr_len = struct.unpack("<H", pkt[2:4])[0]
-            except struct.error:
+                ts_sec, ts_usec, incl_len, orig_len = struct.unpack(f"{endian}IIII", rec_header)
+            except struct.error as e:
+                raise PCAPError(f"Malformed PCAP packet record header at offset {offset}: {e}")
+
+            if incl_len > snaplen or incl_len > 65535:
+                raise PCAPError(f"Malformed packet length {incl_len} exceeds snaplen {snaplen}")
+
+            if incl_len > orig_len:
+                raise PCAPError(f"Invalid packet record length at offset {offset}: captured length ({incl_len}) exceeds original length ({orig_len})")
+
+            pkt = f.read(incl_len)
+            if len(pkt) < incl_len:
+                raise PCAPError(f"Truncated PCAP packet record at offset {offset}: expected {incl_len} bytes, available {len(pkt)} bytes")
+
+            record_idx += 1
+
+            # Process frame based on linktype
+            pkt_offset = 0
+            if linktype == 127: # Radiotap header
+                if len(pkt) < 4:
+                    continue
+                try:
+                    rt_hdr_len = struct.unpack("<H", pkt[2:4])[0]
+                except struct.error:
+                    continue
+                if rt_hdr_len > len(pkt):
+                    continue
+                pkt_offset = rt_hdr_len
+
+            raw_frame = pkt[pkt_offset:]
+            if not raw_frame:
                 continue
-            if rt_hdr_len > len(pkt):
-                continue
-            pkt_offset = rt_hdr_len
 
-        raw_frame = pkt[pkt_offset:]
-        if not raw_frame:
-            continue
-
-        if linktype in (105, 127):
-            # Parse 802.11 Frame
-            if len(raw_frame) < 24:
-                continue
-
-            fc = struct.unpack("<H", raw_frame[0:2])[0]
-            frame_type = (fc >> 2) & 0x03
-            frame_subtype = (fc >> 4) & 0x0F
-            to_ds = (fc >> 8) & 0x01
-            from_ds = (fc >> 9) & 0x01
-
-            # Check Beacon or Probe Response for SSID
-            if frame_type == 0 and frame_subtype in (8, 5): # Beacon (8) or Probe Response (5)
-                if len(raw_frame) > 36 and ssid is None:
-                    # Skip 24-byte MAC header + 12-byte fixed parameters (timestamp 8, beacon int 2, capability 2)
-                    ie_offset = 36
-                    while ie_offset + 2 <= len(raw_frame):
-                        tag_id = raw_frame[ie_offset]
-                        tag_len = raw_frame[ie_offset + 1]
-                        if ie_offset + 2 + tag_len > len(raw_frame):
-                            break
-                        if tag_id == 0: # SSID Tag
-                            try:
-                                tag_val = raw_frame[ie_offset + 2:ie_offset + 2 + tag_len]
-                                decoded_ssid = tag_val.decode("utf-8", errors="ignore")
-                                if decoded_ssid and "\x00" not in decoded_ssid:
-                                    ssid = decoded_ssid
-                            except Exception:
-                                pass
-                            break
-                        ie_offset += 2 + tag_len
-
-            # Check Data frame for EAPOL
-            elif frame_type == 2: # Data frame
-                mac_hdr_len = 24
-                if to_ds and from_ds:
-                    mac_hdr_len = 30
-                # Check QoS Control bit (subtype & 0x08)
-                if frame_subtype & 0x08:
-                    mac_hdr_len += 2
-                # Check HT Control bit (bit 15 of FC)
-                if fc & 0x8000:
-                    mac_hdr_len += 4
-
-                if len(raw_frame) < mac_hdr_len + 8:
+            if linktype in (105, 127):
+                # Parse 802.11 Frame
+                if len(raw_frame) < 24:
                     continue
 
-                # Parse MAC addresses
-                # Addr1: RA/DA, Addr2: TA/SA, Addr3: BSSID
-                addr1 = raw_frame[4:10]
-                addr2 = raw_frame[10:16]
-                addr3 = raw_frame[16:22]
+                fc = struct.unpack("<H", raw_frame[0:2])[0]
+                frame_type = (fc >> 2) & 0x03
+                frame_subtype = (fc >> 4) & 0x0F
+                to_ds = (fc >> 8) & 0x01
+                from_ds = (fc >> 9) & 0x01
 
-                if to_ds == 0 and from_ds == 1: # AP -> Client
-                    client_mac, ap_mac = addr1, addr2
-                elif to_ds == 1 and from_ds == 0: # Client -> AP
-                    ap_mac, client_mac = addr1, addr2
-                else:
-                    client_mac, ap_mac = addr1, addr2
+                # Check Beacon or Probe Response for SSID
+                if frame_type == 0 and frame_subtype in (8, 5): # Beacon (8) or Probe Response (5)
+                    if len(raw_frame) > 36 and ssid is None:
+                        # Skip 24-byte MAC header + 12-byte fixed parameters (timestamp 8, beacon int 2, capability 2)
+                        ie_offset = 36
+                        while ie_offset + 2 <= len(raw_frame):
+                            tag_id = raw_frame[ie_offset]
+                            tag_len = raw_frame[ie_offset + 1]
+                            if ie_offset + 2 + tag_len > len(raw_frame):
+                                break
+                            if tag_id == 0: # SSID Tag
+                                try:
+                                    tag_val = raw_frame[ie_offset + 2:ie_offset + 2 + tag_len]
+                                    decoded_ssid = tag_val.decode("utf-8", errors="ignore")
+                                    if decoded_ssid and "\x00" not in decoded_ssid:
+                                        ssid = decoded_ssid
+                                except Exception:
+                                    pass
+                                break
+                            ie_offset += 2 + tag_len
 
-                llc_snap = raw_frame[mac_hdr_len:mac_hdr_len + 8]
-                # LLC (0xaaaa03), SNAP OUI (0x000000), EtherType (0x888e = EAPOL)
-                if llc_snap.startswith(b"\xaa\xaa\x03\x00\x00\x00") and llc_snap[6:8] == b"\x88\x8e":
-                    eapol_payload = raw_frame[mac_hdr_len + 8:]
-                    parsed_eapol = _parse_eapol_frame(eapol_payload, ap_mac, client_mac)
+                # Check Data frame for EAPOL
+                elif frame_type == 2: # Data frame
+                    mac_hdr_len = 24
+                    if to_ds and from_ds:
+                        mac_hdr_len = 30
+                    # Check QoS Control bit (subtype & 0x08)
+                    if frame_subtype & 0x08:
+                        mac_hdr_len += 2
+                    # Check HT Control bit (bit 15 of FC)
+                    if fc & 0x8000:
+                        mac_hdr_len += 4
+
+                    if len(raw_frame) < mac_hdr_len + 8:
+                        continue
+
+                    # Parse MAC addresses
+                    # Addr1: RA/DA, Addr2: TA/SA, Addr3: BSSID
+                    addr1 = raw_frame[4:10]
+                    addr2 = raw_frame[10:16]
+                    addr3 = raw_frame[16:22]
+
+                    if to_ds == 0 and from_ds == 1: # AP -> Client
+                        client_mac, ap_mac = addr1, addr2
+                    elif to_ds == 1 and from_ds == 0: # Client -> AP
+                        ap_mac, client_mac = addr1, addr2
+                    else:
+                        client_mac, ap_mac = addr1, addr2
+
+                    llc_snap = raw_frame[mac_hdr_len:mac_hdr_len + 8]
+                    # LLC (0xaaaa03), SNAP OUI (0x000000), EtherType (0x888e = EAPOL)
+                    if llc_snap.startswith(b"\xaa\xaa\x03\x00\x00\x00") and llc_snap[6:8] == b"\x88\x8e":
+                        eapol_payload = raw_frame[mac_hdr_len + 8:]
+                        parsed_eapol = _parse_eapol_frame(eapol_payload, ap_mac, client_mac)
+                        if parsed_eapol:
+                            if parsed_eapol["msg_type"] == 1 and msg1_data is None:
+                                msg1_data = parsed_eapol
+                            elif parsed_eapol["msg_type"] == 2 and msg2_data is None:
+                                msg2_data = parsed_eapol
+
+            elif linktype == 1: # Ethernet frame
+                if len(raw_frame) < 14:
+                    continue
+                dst_mac = raw_frame[0:6]
+                src_mac = raw_frame[6:12]
+                ethertype = raw_frame[12:14]
+                if ethertype == b"\x88\x8e":
+                    eapol_payload = raw_frame[14:]
+                    parsed_eapol = _parse_eapol_frame(eapol_payload, src_mac, dst_mac)
                     if parsed_eapol:
                         if parsed_eapol["msg_type"] == 1 and msg1_data is None:
                             msg1_data = parsed_eapol
                         elif parsed_eapol["msg_type"] == 2 and msg2_data is None:
                             msg2_data = parsed_eapol
-
-        elif linktype == 1: # Ethernet frame
-            if len(raw_frame) < 14:
-                continue
-            dst_mac = raw_frame[0:6]
-            src_mac = raw_frame[6:12]
-            ethertype = raw_frame[12:14]
-            if ethertype == b"\x88\x8e":
-                eapol_payload = raw_frame[14:]
-                parsed_eapol = _parse_eapol_frame(eapol_payload, src_mac, dst_mac)
-                if parsed_eapol:
-                    if parsed_eapol["msg_type"] == 1 and msg1_data is None:
-                        msg1_data = parsed_eapol
-                    elif parsed_eapol["msg_type"] == 2 and msg2_data is None:
-                        msg2_data = parsed_eapol
+    finally:
+        f.close()
 
     if not ssid:
         raise PCAPError("Could not find SSID in Beacon/Probe frames in PCAP file.")
@@ -254,48 +267,60 @@ def _parse_eapol_frame(eapol_bytes: bytes, ap_mac: bytes, client_mac: bytes) -> 
     """
     Parse raw EAPOL frame bytes and extract message type, nonce, MIC, and zeroed EAPOL frame.
     """
-    if len(eapol_bytes) < 99: # Min length for EAPOL-Key frame with MIC
+    if not isinstance(eapol_bytes, (bytes, bytearray)) or len(eapol_bytes) < 99: # Min length for EAPOL-Key frame with MIC
         return None
 
-    # EAPOL Header: Version (1), Type (1: 3=Key), Length (2)
-    eapol_ver, eapol_type, eapol_len = struct.unpack(">BBH", eapol_bytes[0:4])
-    if eapol_type != 3: # EAPOL-Key
+    try:
+        # EAPOL Header: Version (1), Type (1: 3=Key), Length (2)
+        eapol_ver, eapol_type, eapol_len = struct.unpack(">BBH", eapol_bytes[0:4])
+        if eapol_type != 3: # EAPOL-Key
+            return None
+
+        # Check declared EAPOL length vs actual payload (4 bytes header + eapol_len)
+        if len(eapol_bytes) < 4 + eapol_len:
+            return None
+
+        key_descriptor_type = eapol_bytes[4]
+        if key_descriptor_type not in (1, 2): # 1 = RC4, 2 = RSN (WPA2)
+            return None
+
+        key_info = struct.unpack(">H", eapol_bytes[5:7])[0]
+        key_mic_bit = (key_info >> 8) & 0x01
+        key_ack_bit = (key_info >> 7) & 0x01
+        pairwise_bit = (key_info >> 3) & 0x01
+
+        if not pairwise_bit:
+            return None
+
+        nonce = eapol_bytes[17:49]
+        mic = eapol_bytes[81:97]
+
+        # Validate non-zero nonces for Handshake Msg1 and Msg2
+        if key_ack_bit == 1 and key_mic_bit == 0:
+            msg_type = 1
+            if nonce == b"\x00" * 32:
+                return None
+        elif key_ack_bit == 0 and key_mic_bit == 1:
+            msg_type = 2
+            if nonce == b"\x00" * 32 or mic == b"\x00" * 16:
+                return None
+        elif key_ack_bit == 1 and key_mic_bit == 1:
+            msg_type = 3
+        else:
+            msg_type = 4
+
+        eapol_zeroed = eapol_bytes[:81] + (b"\x00" * 16) + eapol_bytes[97:]
+
+        return {
+            "msg_type": msg_type,
+            "ap_mac": ap_mac,
+            "client_mac": client_mac,
+            "nonce": nonce,
+            "mic": mic,
+            "eapol_zeroed": eapol_zeroed
+        }
+    except (struct.error, IndexError):
         return None
-
-    key_descriptor_type = eapol_bytes[4]
-    if key_descriptor_type not in (1, 2): # 1 = RC4, 2 = RSN (WPA2)
-        return None
-
-    key_info = struct.unpack(">H", eapol_bytes[5:7])[0]
-    key_mic_bit = (key_info >> 8) & 0x01
-    key_ack_bit = (key_info >> 7) & 0x01
-    pairwise_bit = (key_info >> 3) & 0x01
-
-    if not pairwise_bit:
-        return None
-
-    nonce = eapol_bytes[17:49]
-    mic = eapol_bytes[81:97]
-
-    eapol_zeroed = eapol_bytes[:81] + (b"\x00" * 16) + eapol_bytes[97:]
-
-    if key_ack_bit == 1 and key_mic_bit == 0:
-        msg_type = 1
-    elif key_ack_bit == 0 and key_mic_bit == 1:
-        msg_type = 2
-    elif key_ack_bit == 1 and key_mic_bit == 1:
-        msg_type = 3
-    else:
-        msg_type = 4
-
-    return {
-        "msg_type": msg_type,
-        "ap_mac": ap_mac,
-        "client_mac": client_mac,
-        "nonce": nonce,
-        "mic": mic,
-        "eapol_zeroed": eapol_zeroed
-    }
 
 
 def parse_handshake_scapy(filepath: str) -> HandshakeData:
