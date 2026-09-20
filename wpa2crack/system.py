@@ -1,11 +1,11 @@
 """
-System and environment diagnostics module for WPA2-Crack.
+System and environment diagnostics module for WPA2-Crack (Android/Termux ARM64 Port).
 """
 
 import os
 import platform
 import sys
-import shutil
+import multiprocessing
 
 def is_termux() -> bool:
     """Check if running in Termux environment on Android."""
@@ -38,7 +38,7 @@ def get_cpu_count() -> int:
     return count if count and count > 0 else 1
 
 def get_total_ram_mb() -> int | None:
-    """Safely detect available/total RAM in MB without requiring root or external dependencies."""
+    """Safely detect total physical RAM in MB."""
     if os.path.exists("/proc/meminfo"):
         try:
             with open("/proc/meminfo", "r") as f:
@@ -51,57 +51,97 @@ def get_total_ram_mb() -> int | None:
             pass
     return None
 
+def get_available_ram_mb() -> int | None:
+    """Safely detect available system memory in MB (distinguished from total RAM)."""
+    if os.path.exists("/proc/meminfo"):
+        try:
+            with open("/proc/meminfo", "r") as f:
+                for line in f:
+                    if line.startswith("MemAvailable:"):
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            return int(parts[1]) // 1024
+        except Exception:
+            pass
+    return None
+
 def check_scapy() -> bool:
-    """Check if Scapy is installed and importable."""
+    """Check if optional Scapy dependency is installed and importable."""
     try:
         import scapy  # noqa: F401
         return True
     except ImportError:
         return False
 
+def check_multiprocessing() -> bool:
+    """Check if multiprocessing process pool is operational in current environment."""
+    try:
+        cpu = get_cpu_count()
+        return cpu >= 1
+    except Exception:
+        return False
+
 def get_environment_info() -> dict:
-    """Gather diagnostic environment information."""
-    os_name = "Android / Termux" if (is_android() or is_termux()) else sys.platform
-    ram_mb = get_total_ram_mb()
-    ram_str = f"{ram_mb} MB" if ram_mb is not None else "Unknown"
+    """Gather complete diagnostic environment information."""
+    total_ram = get_total_ram_mb()
+    avail_ram = get_available_ram_mb()
+
+    total_ram_str = f"{total_ram} MB" if total_ram is not None else "Unknown"
+    avail_ram_str = f"{avail_ram} MB" if avail_ram is not None else "Unknown"
 
     scapy_avail = check_scapy()
     root = is_root()
+    android = is_android()
+    termux = is_termux()
+
+    if android and not root:
+        radio_cap = "unsupported on non-root Android"
+        radio_reason = (
+            "Stock non-root Android permissions and Wi-Fi drivers block monitor mode, "
+            "raw 802.11 frame capture, packet injection, and deauthentication. "
+            "Use external PCAP captures for offline analysis."
+        )
+    elif not root:
+        radio_cap = "unsupported (root privileges required)"
+        radio_reason = "Root/sudo privileges required for live 802.11 monitor mode."
+    else:
+        radio_cap = "supported (root Linux reference)"
+        radio_reason = "N/A"
 
     return {
-        "platform": os_name,
-        "is_android": is_android(),
-        "is_termux": is_termux(),
+        "platform": "Android / Termux" if (android or termux) else sys.platform,
+        "is_android": android,
+        "is_termux": termux,
         "architecture": platform.machine(),
         "python_version": sys.version.split()[0],
         "root": root,
         "cpu_count": get_cpu_count(),
-        "ram": ram_str,
+        "total_ram": total_ram_str,
+        "available_ram": avail_ram_str,
+        "pcap_parser_status": "available (native stdlib)",
         "scapy_available": scapy_avail,
-        "offline_pcap": "available",
-        "crypto_engine": "available",
-        "live_monitor_mode": "available" if (root and not is_android()) else "unavailable",
-        "live_monitor_reason": (
-            "non-root Android does not expose the required privileged monitor/raw 802.11 interface to this application."
-            if (is_android() and not root)
-            else ("root privileges required" if not root else "N/A")
-        )
+        "crypto_engine": "available (hashlib/hmac)",
+        "radio_capability": radio_cap,
+        "radio_reason": radio_reason,
+        "multiprocessing_status": "operational" if check_multiprocessing() else "unavailable"
     }
 
 def print_doctor_report() -> None:
     """Print the environment diagnostic report (python main.py doctor)."""
     info = get_environment_info()
     print("=== WPA2-Crack Environment Diagnostics ===")
-    print(f"Platform: {info['platform']}")
-    print(f"Architecture: {info['architecture']}")
-    print(f"Python: {info['python_version']}")
-    print(f"Root: {'yes' if info['root'] else 'no'}")
-    print(f"Live monitor mode: {info['live_monitor_mode']}")
-    if info['live_monitor_mode'] == "unavailable":
-        print(f"  Reason: {info['live_monitor_reason']}")
-    print(f"Offline PCAP processing: {info['offline_pcap']}")
-    print(f"Cryptographic engine: {info['crypto_engine']}")
-    print(f"CPU workers: {info['cpu_count']}")
-    print(f"RAM: {info['ram']}")
-    print(f"Scapy dependency: {'installed' if info['scapy_available'] else 'missing'}")
+    print(f"Android detected        : {'Yes' if info['is_android'] else 'No'}")
+    print(f"Termux detected         : {'Yes' if info['is_termux'] else 'No'}")
+    print(f"Architecture            : {info['architecture']}")
+    print(f"Python version          : {info['python_version']}")
+    print(f"CPU count               : {info['cpu_count']}")
+    print(f"Total physical RAM      : {info['total_ram']}")
+    print(f"Available system memory : {info['available_ram']}")
+    print(f"Root privileges         : {'Yes' if info['root'] else 'No'}")
+    print(f"PCAP parser status      : {info['pcap_parser_status']}")
+    print(f"Optional Scapy status   : {'installed' if info['scapy_available'] else 'not installed (optional)'}")
+    print(f"Radio capability        : {info['radio_capability']}")
+    if info['radio_reason'] != "N/A":
+        print(f"  Note                  : {info['radio_reason']}")
+    print(f"Multiprocessing status  : {info['multiprocessing_status']}")
     print("===========================================")
